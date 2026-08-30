@@ -1,0 +1,67 @@
+[package]
+name = "trialog"
+version = "0.1.0"
+edition = "2021"
+description = "三栏式 AI 聊天桌面应用（聊天历史 / 大纲 / 对话），GPU 渲染，纯 Rust"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "trialog"
+path = "src/main.rs"
+
+# ---------------------------------------------------------------------------
+# GPUI 技术栈：pin 与 tty7（github.com/l0ng-ai/tty7）保持一致
+#
+# gpui / gpui_platform 取 Zed 的同一 rev；gpui-component 取 tty7 使用的
+# l0ng-ai 分支（带 PopupMenu::with_size、1px 菜单分隔线等定制）。三列布局、
+# 可拖拽分隔条、输入区、滚动条、图标、主题全部来自 gpui-component，
+# 本项目不自己造界面控件。
+#
+# 注意：这里刻意不开 `tree-sitter-languages` 特性 —— 那是给 CodeEditor 做
+# 语法高亮用的，聊天界面用不到，而它会把三十来个 C 语法拖进构建，
+# Windows CI 上要多花十几分钟。
+# ---------------------------------------------------------------------------
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = [
+    "font-kit",
+    "runtime_shaders",
+] }
+gpui-component = { git = "https://github.com/l0ng-ai/gpui-component", branch = "tty7", version = "0.5.2" }
+gpui-component-assets = { git = "https://github.com/l0ng-ai/gpui-component", branch = "tty7", version = "0.5.1" }
+
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+log = "0.4"
+dirs = "5"
+
+# 阻塞式 HTTP，只为读 SSE 流；不引入 tokio 运行时。
+# Windows 走 native-tls（schannel），无需 C 工具链；Linux 走 OpenSSL。
+ureq = { version = "2", default-features = false, features = [
+    "json",
+    "native-tls",
+] }
+
+# ---------------------------------------------------------------------------
+# 渲染/解析热路径跨 gpui ↔ gpui-component 边界，thin LTO 与 Zed 的选择一致。
+# codegen-units 留 4：1 在 Windows CI 上要多吃十几分钟，收益却主要在编辑器
+# 那种逐字节路径上，聊天界面吃不到。
+# ---------------------------------------------------------------------------
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev]
+codegen-units = 16
+debug = "limited"
+split-debuginfo = "unpacked"
+
+# gpui 在 opt-level 0 下渲染慢得没法调试，与 tty7 同样的处理。
+[profile.dev.package]
+gpui = { opt-level = 3 }
+gpui_platform = { opt-level = 3 }
+gpui_macros = { opt-level = 3 }

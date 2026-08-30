@@ -1,0 +1,12 @@
+/target
+/dist
+*.zip
+*.exe
+*.pdb
+
+# Cargo.lock 故意提交：本项目的 gpui / gpui-component 都是 git 依赖，
+# 锁定文件是唯一能把 CI 和本地钉在同一份代码上的东西。
+# !Cargo.lock
+
+.DS_Store
+Thumbs.db

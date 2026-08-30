@@ -1,0 +1,64 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  windows:
+    name: trialog (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    # GPUI 依赖树很大（blade-graphics / DirectWrite / skia 系），冷构建
+    # 二十分钟量级。给足上限，别让一个卡住的构建占着 runner 六小时。
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # gpui-component 是 git 依赖，不需要兄弟仓库 checkout。
+      # Windows 后端（gpui_windows + DirectWrite / D3D）用的 SDK
+      # windows-latest 镜像自带，没有额外的系统依赖要装。
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/x86_64-pc-windows-msvc/release/trialog.exe dist/
+          powershell -NoProfile -Command "Compress-Archive -Path dist/trialog.exe -DestinationPath trialog-windows-x86_64.zip -Force"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trialog-windows-x86_64
+          path: |
+            dist/trialog.exe
+            trialog-windows-x86_64.zip
+          if-no-files-found: error
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: trialog-windows-x86_64.zip
+          generate_release_notes: true
