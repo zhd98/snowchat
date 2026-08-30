@@ -6,23 +6,88 @@
 //! 读失败一律降级成默认值而不是报错退出：一份坏掉的配置文件不该让
 //! 应用打不开。写失败只记日志 —— 用户此刻正聊着天，弹窗没有意义。
 
-use crate::model::{Conversation, Message};
+use crate::model::{new_id, Conversation, Message};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// 接口协议。
+///
+/// 只分这两族，是因为 wire format 真的不同：URL 后缀、鉴权头、请求体结构、
+/// SSE 的事件形状都不一样。至于 DeepSeek、通义、月之暗面、本地 Ollama —— 它们
+/// 都是 OpenAI 那一族的方言，选 `OpenAi` 改个地址就行，不需要各自的枚举值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerKind {
+    #[default]
+    OpenAi,
+    Claude,
+}
+
+impl ServerKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ServerKind::OpenAi => "OpenAI 兼容",
+            ServerKind::Claude => "Claude",
+        }
+    }
+
+    /// 换协议时用来填默认的地址与模型。
+    pub fn default_url(&self) -> &'static str {
+        match self {
+            ServerKind::OpenAi => "https://api.openai.com/v1",
+            ServerKind::Claude => "https://api.anthropic.com/v1",
+        }
+    }
+
+    pub fn default_model(&self) -> &'static str {
+        match self {
+            ServerKind::OpenAi => "gpt-4o-mini",
+            ServerKind::Claude => "claude-sonnet-4-5",
+        }
+    }
+}
+
+/// 一个 AI 服务。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Server {
+    pub id: String,
+    pub name: String,
+    pub kind: ServerKind,
+    /// 接口根地址，结尾不带斜杠。
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub system_prompt: String,
+    pub temperature: f32,
+    /// 只 Claude 强制要求（流式时必须给 max_tokens），但两家都接受，
+    /// 所以统一放在这里，省得为一个字段分叉出两套请求构造。
+    pub max_tokens: u32,
+}
+
+impl Server {
+    pub fn new(kind: ServerKind) -> Self {
+        Self {
+            id: new_id(),
+            name: kind.label().to_string(),
+            kind,
+            base_url: kind.default_url().to_string(),
+            api_key: String::new(),
+            model: kind.default_model().to_string(),
+            system_prompt: default_system_prompt(),
+            temperature: 0.7,
+            max_tokens: 4096,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// OpenAI 兼容接口的根地址，结尾不带斜杠。
-    #[serde(default = "default_base_url")]
-    pub base_url: String,
+    /// 可以配多个服务，切换着用。
     #[serde(default)]
-    pub api_key: String,
-    #[serde(default = "default_model")]
-    pub model: String,
-    #[serde(default = "default_system_prompt")]
-    pub system_prompt: String,
-    #[serde(default = "default_temperature")]
-    pub temperature: f32,
+    pub servers: Vec<Server>,
+    /// 当前发消息走哪一个（`Server::id`）。
+    #[serde(default)]
+    pub active_server: Option<String>,
     #[serde(default)]
     pub dark_mode: bool,
     /// 三栏宽度，拖拽分隔条后写回。
@@ -30,19 +95,23 @@ pub struct Config {
     pub history_width: f32,
     #[serde(default = "default_outline_width")]
     pub outline_width: f32,
+
+    // ---- 旧版（0.1.0）的扁平字段，只为迁移保留 ----
+    // 读上来是 Some 就说明这是老配置，load 时折成一个 Server 再置 None。
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
 }
 
-fn default_base_url() -> String {
-    "https://api.openai.com/v1".to_string()
-}
-fn default_model() -> String {
-    "gpt-4o-mini".to_string()
-}
 fn default_system_prompt() -> String {
     "你是一个简洁、准确的助手。用中文回答。".to_string()
-}
-fn default_temperature() -> f32 {
-    0.7
 }
 fn default_history_width() -> f32 {
     240.
@@ -53,16 +122,89 @@ fn default_outline_width() -> f32 {
 
 impl Default for Config {
     fn default() -> Self {
+        let server = Server::new(ServerKind::OpenAi);
+        let id = server.id.clone();
         Self {
-            base_url: default_base_url(),
-            api_key: String::new(),
-            model: default_model(),
-            system_prompt: default_system_prompt(),
-            temperature: default_temperature(),
+            servers: vec![server],
+            active_server: Some(id),
             dark_mode: false,
             history_width: default_history_width(),
             outline_width: default_outline_width(),
+            base_url: None,
+            api_key: None,
+            model: None,
+            system_prompt: None,
+            temperature: None,
         }
+    }
+}
+
+impl Config {
+    /// 把 0.1.0 时代的扁平配置折成一个服务。
+    ///
+    /// 只在 `servers` 为空时动手 —— 已经迁移过的配置不该被这些残留字段
+    /// 再改一次。折完把旧字段清空，下次存盘就落干净了。
+    fn migrate(&mut self) {
+        if !self.servers.is_empty() {
+            return;
+        }
+        let legacy = self.base_url.is_some()
+            || self.api_key.is_some()
+            || self.model.is_some()
+            || self.system_prompt.is_some()
+            || self.temperature.is_some();
+        if !legacy {
+            return;
+        }
+
+        let mut server = Server::new(ServerKind::OpenAi);
+        if let Some(url) = self.base_url.take() {
+            if !url.trim().is_empty() {
+                server.base_url = url;
+            }
+        }
+        if let Some(key) = self.api_key.take() {
+            server.api_key = key;
+        }
+        if let Some(model) = self.model.take() {
+            if !model.trim().is_empty() {
+                server.model = model;
+            }
+        }
+        if let Some(prompt) = self.system_prompt.take() {
+            server.system_prompt = prompt;
+        }
+        if let Some(temperature) = self.temperature.take() {
+            server.temperature = temperature;
+        }
+
+        let id = server.id.clone();
+        self.servers.push(server);
+        self.active_server = Some(id);
+    }
+
+    /// 当前在用的服务。
+    pub fn server(&self) -> Option<&Server> {
+        self.active_server
+            .as_deref()
+            .and_then(|id| self.servers.iter().find(|s| s.id == id))
+            .or_else(|| self.servers.first())
+    }
+
+    pub fn server_mut(&mut self) -> Option<&mut Server> {
+        let id = self.active_server.clone();
+        match id {
+            Some(id) => self.servers.iter_mut().find(|s| s.id == id),
+            None => self.servers.first_mut(),
+        }
+    }
+
+    pub fn find(&self, id: &str) -> Option<&Server> {
+        self.servers.iter().find(|s| s.id == id)
+    }
+
+    pub fn find_mut(&mut self, id: &str) -> Option<&mut Server> {
+        self.servers.iter_mut().find(|s| s.id == id)
     }
 }
 
@@ -81,8 +223,20 @@ pub struct Store {
 impl Store {
     pub fn load() -> Self {
         let dir = config_dir();
-        let config: Config = read_json(&dir.join("config.json")).unwrap_or_default();
+        let mut config: Config = read_json(&dir.join("config.json")).unwrap_or_default();
         let file: ConversationFile = read_json(&dir.join("conversations.json")).unwrap_or_default();
+
+        config.migrate();
+        // 一个服务都没有（配置被手工清空过）就补一个默认的，
+        // 否则界面上连"没有可用服务"之外的东西都画不出来。
+        if config.servers.is_empty() {
+            let server = Server::new(ServerKind::OpenAi);
+            config.active_server = Some(server.id.clone());
+            config.servers.push(server);
+        }
+        if config.server().is_none() {
+            config.active_server = config.servers.first().map(|s| s.id.clone());
+        }
 
         let mut conversations = file.conversations;
         // 存盘时任何"正在接收"的消息都已经被拒之门外（见 `Message::streaming`

@@ -7,7 +7,7 @@
 use crate::ai::{self, StreamMsg};
 use crate::markdown;
 use crate::model::{Conversation, Message, OutlineNode, Role};
-use crate::store::{Config, Store};
+use crate::store::{Server, ServerKind, Store};
 use crate::theme;
 
 use gpui::{
@@ -52,12 +52,23 @@ pub struct Workspace {
     // ---- 控件 ----
     pub composer: Entity<InputState>,
     pub search: Entity<InputState>,
+    /// 设置面板右侧那几个编辑框，绑定的是 `editing_server` 指向的服务。
+    pub cfg_name: Entity<InputState>,
     pub cfg_base_url: Entity<InputState>,
     pub cfg_api_key: Entity<InputState>,
     pub cfg_model: Entity<InputState>,
     pub cfg_system: Entity<InputState>,
+    pub cfg_temperature: Entity<InputState>,
+    pub cfg_max_tokens: Entity<InputState>,
 
     pub settings_open: bool,
+    /// 设置面板正在编辑哪个服务（`Server::id`）。
+    pub editing_server: Option<String>,
+    /// 刷新出来的模型列表，属于 `editing_server`。
+    pub models: Vec<String>,
+    pub fetching_models: bool,
+    /// 模型那一栏下面的一句话提示（数量或失败原因）。
+    pub model_hint: Option<SharedString>,
 
     streaming: Option<Streaming>,
     /// 顶栏右下角的一句话状态（错误、正在接收……）。
@@ -96,28 +107,21 @@ impl Workspace {
         });
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索历史…"));
 
-        let cfg_base_url = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(store.config.base_url.clone())
-                .placeholder("https://api.openai.com/v1")
-        });
-        let cfg_api_key = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(store.config.api_key.clone())
-                .placeholder("sk-…（留空表示服务端不需要密钥）")
-        });
-        let cfg_model = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(store.config.model.clone())
-                .placeholder("gpt-4o-mini")
-        });
+        // 设置面板的编辑框。初值在打开面板时灌，这里只定好形状和占位符。
+        let cfg_name = cx.new(|cx| InputState::new(window, cx).placeholder("服务的名字"));
+        let cfg_base_url =
+            cx.new(|cx| InputState::new(window, cx).placeholder("https://api.openai.com/v1"));
+        let cfg_api_key =
+            cx.new(|cx| InputState::new(window, cx).placeholder("留空表示服务端不需要密钥"));
+        let cfg_model = cx.new(|cx| InputState::new(window, cx).placeholder("点右边的刷新拉取"));
         let cfg_system = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
                 .rows(3)
-                .default_value(store.config.system_prompt.clone())
                 .placeholder("系统提示词")
         });
+        let cfg_temperature = cx.new(|cx| InputState::new(window, cx).placeholder("0.7"));
+        let cfg_max_tokens = cx.new(|cx| InputState::new(window, cx).placeholder("4096"));
 
         // 主题在窗口渲染之前定好，免得先白后黑闪一下。
         Theme::change(
@@ -145,11 +149,18 @@ impl Workspace {
             outline_visible: true,
             composer,
             search,
+            cfg_name,
             cfg_base_url,
             cfg_api_key,
             cfg_model,
             cfg_system,
+            cfg_temperature,
+            cfg_max_tokens,
             settings_open: false,
+            editing_server: None,
+            models: Vec::new(),
+            fetching_models: false,
+            model_hint: None,
             streaming: None,
             status: None,
             chat_scroll: ScrollHandle::new(),
@@ -381,15 +392,34 @@ impl Workspace {
             })
             .unwrap_or_default();
 
+        // 没有配好的服务就别发，说清楚原因比转一圈再报错强。
+        let Some(server) = self.store.server().cloned() else {
+            self.store.mark_error(
+                &conversation_id,
+                "还没有可用的 AI 服务。到设置里配一个。".to_string(),
+            );
+            self.store.save();
+            cx.notify();
+            return;
+        };
+        if server.base_url.trim().is_empty() || server.model.trim().is_empty() {
+            self.store.mark_error(
+                &conversation_id,
+                format!("服务「{}」还缺接口地址或模型。到设置里补上。", server.name),
+            );
+            self.store.save();
+            cx.notify();
+            return;
+        }
+
         let (tx, rx) = mpsc::channel::<StreamMsg>();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
-        let config: Config = self.store.config.clone();
 
         let task = cx.spawn(async move |this, cx| {
             // 阻塞的 HTTP 读放后台线程池，主线程只负责收增量。
             let worker = cx.background_executor().spawn(async move {
-                ai::stream_chat(&config, history, worker_cancel, tx);
+                ai::stream_chat(&server, history, worker_cancel, tx);
             });
 
             loop {
@@ -473,53 +503,286 @@ impl Workspace {
         cx.notify();
     }
 
-    // ---- 设置 ----
+    // ---- 设置：多服务 ----
 
     pub(crate) fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.settings_open {
-            // 每次打开都从 config 重新灌一遍，免得改了没保存、关掉再开
+            // 每次打开都从 store 重新灌一遍，免得改了没保存、关掉再开
             // 还显示着上次的草稿。
-            let config = self.store.config.clone();
-            self.sync_settings_inputs(&config, window, cx);
+            let id = self
+                .store
+                .server()
+                .map(|s| s.id.clone())
+                .or_else(|| self.store.config.servers.first().map(|s| s.id.clone()));
+            self.editing_server = id;
+            self.models.clear();
+            self.model_hint = None;
+            self.fetching_models = false;
+            self.sync_server_inputs(window, cx);
         }
         self.settings_open = !self.settings_open;
         cx.notify();
     }
 
-    fn sync_settings_inputs(
-        &mut self,
-        config: &Config,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// 把 `editing_server` 指向的服务灌进编辑框。
+    fn sync_server_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(server) = self
+            .editing_server
+            .as_ref()
+            .and_then(|id| self.store.find(id))
+            .cloned()
+        else {
+            return;
+        };
+
+        self.cfg_name.update(cx, |state, cx| {
+            state.set_value(server.name.clone(), window, cx)
+        });
         self.cfg_base_url.update(cx, |state, cx| {
-            state.set_value(config.base_url.clone(), window, cx)
+            state.set_value(server.base_url.clone(), window, cx)
         });
         self.cfg_api_key.update(cx, |state, cx| {
-            state.set_value(config.api_key.clone(), window, cx)
+            state.set_value(server.api_key.clone(), window, cx)
         });
         self.cfg_model.update(cx, |state, cx| {
-            state.set_value(config.model.clone(), window, cx)
+            state.set_value(server.model.clone(), window, cx)
         });
         self.cfg_system.update(cx, |state, cx| {
-            state.set_value(config.system_prompt.clone(), window, cx)
+            state.set_value(server.system_prompt.clone(), window, cx)
+        });
+        self.cfg_temperature.update(cx, |state, cx| {
+            state.set_value(format!("{}", server.temperature), window, cx)
+        });
+        self.cfg_max_tokens.update(cx, |state, cx| {
+            state.set_value(format!("{}", server.max_tokens), window, cx)
         });
     }
 
-    pub(crate) fn save_settings(&mut self, cx: &mut Context<Self>) {
+    /// 加一个服务，并把面板切到它。
+    pub(crate) fn add_server(
+        &mut self,
+        kind: ServerKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut server = Server::new(kind);
+        // 同名服务加第二个时起个不重名的，列表里全是"OpenAI 兼容"没法认。
+        let same = self
+            .store
+            .config
+            .servers
+            .iter()
+            .filter(|s| s.name == server.name)
+            .count();
+        if same > 0 {
+            server.name = format!("{} {}", server.name, same + 1);
+        }
+        let id = server.id.clone();
+        self.store.config.servers.push(server);
+        self.editing_server = Some(id);
+        self.models.clear();
+        self.model_hint = None;
+        self.sync_server_inputs(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn remove_server(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 最后一个不给删：删空了界面上连"没有可用服务"之外的东西都画不出来，
+        // 而用户只是想换一个服务，不是想清空配置。
+        if self.store.config.servers.len() <= 1 {
+            return;
+        }
+        self.store.config.servers.retain(|s| s.id != id);
+        if self.store.config.active_server.as_deref() == Some(id.as_str()) {
+            self.store.config.active_server =
+                self.store.config.servers.first().map(|s| s.id.clone());
+        }
+        if self.editing_server.as_deref() == Some(id.as_str()) {
+            self.editing_server = self.store.config.servers.first().map(|s| s.id.clone());
+            self.models.clear();
+            self.model_hint = None;
+            self.sync_server_inputs(window, cx);
+        }
+        self.store.save();
+        cx.notify();
+    }
+
+    /// 切换面板正在编辑的服务。
+    pub(crate) fn edit_server(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing_server.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        self.editing_server = Some(id);
+        // 模型列表属于上一个服务，换服务就作废，免得点了套到别家去。
+        self.models.clear();
+        self.model_hint = None;
+        self.sync_server_inputs(window, cx);
+        cx.notify();
+    }
+
+    /// 换协议。地址与模型还停在上一个协议的默认值时才跟着换 ——
+    /// 用户自己填过的地址不该被一句"换个协议"冲掉。
+    pub(crate) fn set_server_kind(
+        &mut self,
+        kind: ServerKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.editing_server.clone() else {
+            return;
+        };
+        let Some(server) = self.store.find_mut(&id) else {
+            return;
+        };
+        let previous = server.kind;
+        if previous == kind {
+            return;
+        }
+        if server.base_url.trim() == previous.default_url() {
+            server.base_url = kind.default_url().to_string();
+        }
+        if server.model.trim() == previous.default_model() {
+            server.model = kind.default_model().to_string();
+        }
+        server.kind = kind;
+        self.models.clear();
+        self.model_hint = None;
+        self.sync_server_inputs(window, cx);
+        cx.notify();
+    }
+
+    /// 把当前编辑的服务设为发消息用的那个。
+    pub(crate) fn use_server(&mut self, id: String, cx: &mut Context<Self>) {
+        self.store.config.active_server = Some(id);
+        self.store.save();
+        cx.notify();
+    }
+
+    /// 从刷新出来的列表里挑一个模型。
+    pub(crate) fn pick_model(
+        &mut self,
+        model: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cfg_model
+            .update(cx, |state, cx| state.set_value(model, window, cx));
+        cx.notify();
+    }
+
+    /// 拉模型列表。阻塞的 HTTP 走后台线程池，回来再贴到界面上。
+    pub(crate) fn refresh_models(&mut self, cx: &mut Context<Self>) {
+        if self.fetching_models {
+            return;
+        }
+        let Some(server) = self
+            .editing_server
+            .as_ref()
+            .and_then(|id| self.store.find(id))
+            .cloned()
+        else {
+            return;
+        };
+        // 先把编辑框里的东西落到服务上，否则刷新用的是上一次保存的值，
+        // 用户刚改的地址不生效。
+        self.apply_server_inputs(cx);
+
+        if server.base_url.trim().is_empty() {
+            self.model_hint = Some("先填接口地址再刷新".into());
+            cx.notify();
+            return;
+        }
+
+        self.fetching_models = true;
+        self.model_hint = Some("正在拉取模型列表…".into());
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { ai::fetch_models(&server) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.fetching_models = false;
+                match result {
+                    Ok(models) => {
+                        let count = models.len();
+                        this.models = models;
+                        this.model_hint = if count == 0 {
+                            Some("服务端没返回任何模型".into())
+                        } else {
+                            Some(format!("拉取到 {count} 个模型，点一下即可选中").into())
+                        };
+                    }
+                    Err(error) => {
+                        this.models.clear();
+                        this.model_hint = Some(format!("拉取失败：{error}").into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 把编辑框的值写回 `editing_server`。
+    ///
+    /// 数值字段解析失败就保持原值：把 temperature 输成 "abc" 不该让它
+    /// 悄悄变成 0，那样下一次保存就把用户的设置毁了。
+    fn apply_server_inputs(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.editing_server.clone() else {
+            return;
+        };
+        let name = self.cfg_name.read(cx).value().trim().to_string();
         let base_url = self.cfg_base_url.read(cx).value().trim().to_string();
         let api_key = self.cfg_api_key.read(cx).value().trim().to_string();
         let model = self.cfg_model.read(cx).value().trim().to_string();
         let system_prompt = self.cfg_system.read(cx).value().to_string();
+        let temperature = self
+            .cfg_temperature
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<f32>()
+            .ok();
+        let max_tokens = self
+            .cfg_max_tokens
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u32>()
+            .ok();
 
-        if !base_url.is_empty() {
-            self.store.config.base_url = base_url;
+        let Some(server) = self.store.find_mut(&id) else {
+            return;
+        };
+        if !name.is_empty() {
+            server.name = name;
         }
-        if !model.is_empty() {
-            self.store.config.model = model;
+        server.base_url = base_url;
+        server.api_key = api_key;
+        server.model = model;
+        server.system_prompt = system_prompt;
+        if let Some(temperature) = temperature {
+            server.temperature = temperature;
         }
-        self.store.config.api_key = api_key;
-        self.store.config.system_prompt = system_prompt;
+        if let Some(max_tokens) = max_tokens {
+            server.max_tokens = max_tokens;
+        }
+    }
+
+    pub(crate) fn save_settings(&mut self, cx: &mut Context<Self>) {
+        self.apply_server_inputs(cx);
+        // 编辑中的服务顺带设为当前在用：改了半天配置，关掉面板发消息却
+        // 走的还是另一个服务，这种事不该发生。
+        if let Some(id) = self.editing_server.clone() {
+            self.store.config.active_server = Some(id);
+        }
         self.store.save();
         self.settings_open = false;
         cx.notify();

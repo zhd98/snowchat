@@ -68,7 +68,12 @@ impl Workspace {
             .map(|c| c.title.clone())
             .unwrap_or_else(|| "没有打开的对话".to_string())
             .into();
-        let model = self.store.config.model.clone();
+        // 顶栏显示"哪个服务 / 哪个模型"，一眼能看出这条消息会发去哪里。
+        let model = self
+            .store
+            .server()
+            .map(|s| format!("{} · {}", s.name, s.model))
+            .unwrap_or_else(|| "未配置服务".to_string());
 
         // 上一帧的滚动偏移。配合下面记下的容器 y，才能把消息的窗口坐标
         // 换算成内容坐标。
